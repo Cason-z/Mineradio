@@ -17710,6 +17710,19 @@ function mergeSongSearchResults(neteaseSongs, qqSongs, limit, q, lxSongs) {
   out.sort(function(a, b){ return (b._searchScore || 0) - (a._searchScore || 0); });
   return out.slice(0, limit);
 }
+function wrapSongsForLxSourcePlayback(songs) {
+  var apiId = lxSourcePreference.apiId || (selectedLxSource() && selectedLxSource().id) || '';
+  return (songs || []).map(function(song) {
+    var originalProvider = songProviderKey(song);
+    return Object.assign({}, song, {
+      provider: 'lx',
+      source: 'lx',
+      lxApiId: apiId,
+      lxOriginalProvider: originalProvider,
+      lxOriginalSource: song.source || song.provider || originalProvider
+    });
+  });
+}
 async function fetchMusicSearchResults(q, mode) {
   if (mode === 'qq') {
     var qqOnly = await apiJson('/api/qq/search?keywords=' + encodeURIComponent(q) + '&limit=12');
@@ -17718,7 +17731,14 @@ async function fetchMusicSearchResults(q, mode) {
   if (mode === 'lx') {
     if (!lxSourcesReady()) await refreshLxSources(true);
     var lxOnly = await apiJson('/api/lx/search?keywords=' + encodeURIComponent(q) + '&limit=18');
-    return mergeSongSearchResults([], [], 18, q, lxOnly.songs || []);
+    if (lxOnly.songs && lxOnly.songs.length) return mergeSongSearchResults([], [], 18, q, lxOnly.songs || []);
+    var fallback = await Promise.allSettled([
+      apiJson('/api/search?keywords=' + encodeURIComponent(q) + '&limit=10'),
+      apiJson('/api/qq/search?keywords=' + encodeURIComponent(q) + '&limit=10')
+    ]);
+    var fallbackNetease = fallback[0].status === 'fulfilled' ? ((fallback[0].value && fallback[0].value.songs) || []) : [];
+    var fallbackQQ = fallback[1].status === 'fulfilled' ? ((fallback[1].value && fallback[1].value.songs) || []) : [];
+    return wrapSongsForLxSourcePlayback(mergeSongSearchResults(fallbackNetease, fallbackQQ, 18, q));
   }
   if (mode === 'netease') {
     var neOnly = await apiJson('/api/search?keywords=' + encodeURIComponent(q) + '&limit=18');
