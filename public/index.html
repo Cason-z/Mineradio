@@ -17784,7 +17784,9 @@ async function doSearch(q, opts) {
     if (!songs.length) {
       playlist = [];
       searchLastResultQuery = '';
-      $results.innerHTML = '<div class="search-empty">没有找到相关歌曲</div>';
+      var emptyText = '没有找到相关歌曲';
+      if (mode === 'lx') emptyText = lxSourcesReady() ? '当前 LX 音源没有返回搜索结果；很多 LX 源只支持播放解析，不支持搜索。' : '还没有导入可用 LX 音源';
+      $results.innerHTML = '<div class="search-empty">' + escHtml(emptyText) + '</div>';
       $results.classList.add('show');
       return;
     }
