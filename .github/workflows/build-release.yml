@@ -1,0 +1,70 @@
+name: Build Windows Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax checks
+        shell: pwsh
+        run: |
+          git diff --check
+          node --check server.js
+          node -e "const fs=require('fs');const s=fs.readFileSync('public/index.html','utf8');const blocks=[...s.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m=>m[1]); for (const b of blocks) new Function(b); console.log('inline scripts ok:', blocks.length);"
+
+      - name: Build Windows installer
+        run: npm run build:win
+
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem -LiteralPath dist -File | Where-Object { $_.Name -match '\.(exe|blockmap|yml)$' } | ForEach-Object {
+            $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName
+            "$($hash.Hash)  $($_.Name)"
+          } | Set-Content -LiteralPath dist\SHA256SUMS.txt -Encoding utf8
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mineradio-Windows-${{ github.ref_name }}
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Mineradio ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+            dist/SHA256SUMS.txt

@@ -49,6 +49,7 @@ const https = require('https');
 const fs   = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const vm = require('vm');
 const tls = require('tls');
 const { once } = require('events');
 const { fileURLToPath } = require('url');
@@ -59,6 +60,7 @@ const HOST = process.env.HOST || '0.0.0.0';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const COOKIE_FILE = process.env.COOKIE_FILE || path.join(__dirname, '.cookie');
 const QQ_COOKIE_FILE = process.env.QQ_COOKIE_FILE || path.join(__dirname, '.qq-cookie');
+const LX_SOURCE_DIR = process.env.MINERADIO_LX_SOURCE_DIR || path.join(__dirname, 'user-sources', 'lx');
 const UPDATE_WORK_DIR = process.env.MINERADIO_UPDATE_DIR || path.join(__dirname, 'updates');
 const UPDATE_DOWNLOAD_DIR = process.env.MINERADIO_UPDATE_DOWNLOAD_DIR || path.join(UPDATE_WORK_DIR, 'downloads');
 const UPDATE_PATCH_BACKUP_DIR = process.env.MINERADIO_PATCH_BACKUP_DIR || path.join(UPDATE_WORK_DIR, 'backups', 'patches');
@@ -1376,7 +1378,7 @@ function readRequestBody(req) {
     let raw = '';
     req.on('data', chunk => {
       raw += chunk;
-      if (raw.length > 8 * 1024 * 1024) req.destroy();
+      if (raw.length > 24 * 1024 * 1024) req.destroy();
     });
     req.on('end', () => {
       if (!raw) { resolve({}); return; }
@@ -1604,6 +1606,214 @@ function mapDiscoverPlaylist(pl, tag) {
     creator: creator.nickname || creator.name || '',
     tag: tag || pl.alg || '',
   };
+}
+
+// ---------- LX Music 自定义源兼容层 ----------
+const LX_EVENT_NAMES = Object.freeze({ request: 'request', inited: 'inited', updateAlert: 'updateAlert' });
+const lxRuntimeCache = new Map();
+
+function ensureLxSourceDir() { fs.mkdirSync(LX_SOURCE_DIR, { recursive: true }); }
+function parseLxSourceMeta(script, fallbackName) {
+  const meta = {};
+  String(script || '').slice(0, 4096).replace(/@([a-zA-Z_][\w-]*)\s+([^\r\n*]+)/g, (_, key, value) => {
+    meta[key] = String(value || '').trim();
+    return _;
+  });
+  return {
+    name: meta.name || fallbackName || 'LX 自定义源',
+    description: meta.description || '',
+    version: meta.version || '',
+    author: meta.author || '',
+    homepage: meta.homepage || '',
+    updateUrl: meta.update_url || meta.updateUrl || '',
+  };
+}
+function publicLxSourceInfo(info) {
+  return {
+    id: info.id, name: info.name, description: info.description || '', version: info.version || '', author: info.author || '',
+    status: info.status || 'unknown', message: info.message || '', sources: info.sources || {}, sourceKeys: Object.keys(info.sources || {}),
+  };
+}
+function listLxSourceFiles() {
+  ensureLxSourceDir();
+  return fs.readdirSync(LX_SOURCE_DIR).filter(name => name.endsWith('.js')).map(name => path.join(LX_SOURCE_DIR, name));
+}
+async function lxRequest(urlLike, options, callback) {
+  if (typeof options === 'function') { callback = options; options = {}; }
+  options = options || {};
+  try {
+    const headers = Object.assign({ 'User-Agent': UA }, options.headers || {});
+    let requestBody = options.body;
+    if (requestBody && typeof requestBody === 'object' && !(requestBody instanceof Buffer) && !(requestBody instanceof Uint8Array) && typeof requestBody.pipe !== 'function') {
+      requestBody = JSON.stringify(requestBody);
+      if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/json';
+    }
+    const controller = options.timeout && AbortController ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), Number(options.timeout) || 15000) : null;
+    const resp = await fetch(String(urlLike), { method: options.method || (requestBody ? 'POST' : 'GET'), headers, body: requestBody, redirect: 'follow', signal: controller && controller.signal });
+    if (timer) clearTimeout(timer);
+    const text = await resp.text();
+    const contentType = resp.headers.get('content-type') || '';
+    let body = text;
+    if (/json/i.test(contentType) || /^[\s\r\n]*[\[{]/.test(text)) { try { body = JSON.parse(text); } catch (_) {} }
+    const result = { statusCode: resp.status, status: resp.status, headers: Object.fromEntries(resp.headers.entries()), body, rawBody: text };
+    if (callback) callback(null, result);
+    return result;
+  } catch (err) { if (callback) callback(err); else throw err; }
+}
+function waitForLxInit(runtime, timeoutMs) {
+  if (runtime.inited) return Promise.resolve(runtime);
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(runtime), timeoutMs || 900);
+    runtime.waiters.push(() => { clearTimeout(timer); resolve(runtime); });
+  });
+}
+async function loadLxSourceRuntime(filePath) {
+  const stat = fs.statSync(filePath);
+  const cacheKey = filePath + ':' + stat.mtimeMs + ':' + stat.size;
+  if (lxRuntimeCache.has(cacheKey)) return waitForLxInit(lxRuntimeCache.get(cacheKey), 1200);
+  const script = fs.readFileSync(filePath, 'utf8');
+  const id = path.basename(filePath, '.js');
+  const meta = parseLxSourceMeta(script, id);
+  const runtime = { id, filePath, name: meta.name, description: meta.description, version: meta.version, author: meta.author, homepage: meta.homepage, updateUrl: meta.updateUrl, status: 'loading', message: '', sources: {}, requestHandler: null, inited: false, waiters: [] };
+  function markInited(payload) {
+    const init = payload && (payload.sources ? payload : payload.init) || payload || {};
+    runtime.sources = init.sources || runtime.sources || {};
+    runtime.status = Object.keys(runtime.sources).length ? 'ready' : 'empty';
+    runtime.message = runtime.status === 'ready' ? '' : '源未声明可用平台';
+    runtime.inited = true;
+    runtime.waiters.splice(0).forEach(fn => { try { fn(); } catch (_) {} });
+  }
+  const sandbox = { console, setTimeout, clearTimeout, setInterval, clearInterval, URL, URLSearchParams, TextEncoder, TextDecoder, Buffer, Promise, JSON, Math, Date, parseInt, parseFloat, encodeURIComponent, decodeURIComponent };
+  sandbox.globalThis = sandbox; sandbox.window = sandbox; sandbox.fetch = fetch;
+  sandbox.lx = {
+    version: APP_VERSION, env: 'desktop', EVENT_NAMES: LX_EVENT_NAMES, currentScriptInfo: { name: runtime.name, version: runtime.version, author: runtime.author },
+    request: lxRequest,
+    on(eventName, handler) { if (eventName === LX_EVENT_NAMES.request) runtime.requestHandler = handler; },
+    send(eventName, payload) { if (eventName === LX_EVENT_NAMES.inited) markInited(payload); if (eventName === LX_EVENT_NAMES.updateAlert) runtime.update = payload || null; },
+    utils: {},
+  };
+  try {
+    vm.createContext(sandbox);
+    new vm.Script(script, { filename: filePath, displayErrors: true }).runInContext(sandbox, { timeout: 1000 });
+    setTimeout(() => { if (!runtime.inited) markInited({ sources: runtime.sources || {} }); }, 900);
+  } catch (err) {
+    runtime.status = 'failed'; runtime.message = err.message || String(err); runtime.inited = true;
+  }
+  lxRuntimeCache.clear();
+  lxRuntimeCache.set(cacheKey, runtime);
+  return waitForLxInit(runtime, 1200);
+}
+async function getLxSourceList() {
+  const files = listLxSourceFiles();
+  const runtimes = await Promise.all(files.map(file => loadLxSourceRuntime(file).catch(err => ({ id: path.basename(file, '.js'), name: path.basename(file, '.js'), status: 'failed', message: err.message, sources: {} }))));
+  return runtimes.map(publicLxSourceInfo);
+}
+async function importLxSource(script, preferredName) {
+  script = String(script || '').trim();
+  if (!script || script.length < 20) throw new Error('EMPTY_LX_SOURCE_SCRIPT');
+  if (!/globalThis\s*\[?['"]?lx|globalThis\.lx|EVENT_NAMES|musicUrl/.test(script)) throw new Error('NOT_LX_SOURCE_SCRIPT');
+  ensureLxSourceDir();
+  const hash = crypto.createHash('sha256').update(script).digest('hex').slice(0, 16);
+  const meta = parseLxSourceMeta(script, preferredName || 'LX 自定义源');
+  const safeName = String(meta.name || preferredName || 'lx-source').replace(/[\\/:*?"<>|\r\n]+/g, '_').slice(0, 64) || 'lx-source';
+  const filePath = path.join(LX_SOURCE_DIR, `${safeName}-${hash}.js`);
+  fs.writeFileSync(filePath, script, 'utf8');
+  lxRuntimeCache.clear();
+  return publicLxSourceInfo(await loadLxSourceRuntime(filePath));
+}
+function lxSourceKeyForSong(song, requestedSource) {
+  if (requestedSource) return requestedSource;
+  if (song && song.lxSource) return String(song.lxSource);
+  if (song && song.lxOriginalProvider) return String(song.lxOriginalProvider);
+  const provider = String(song && (song.provider || song.source || song.type) || '').toLowerCase();
+  if (provider === 'qsvip') return 'qsvip';
+  if (provider === 'qq' || provider === 'tx') return 'tx';
+  if (provider === 'netease' || provider === 'wy') return 'wy';
+  if (provider === 'kg' || provider === 'kw' || provider === 'mg') return provider;
+  return 'wy';
+}
+function lxQualityForSong(sourceInfo, requestedQuality) {
+  const pref = normalizeQualityPreference(requestedQuality);
+  const preferred = pref === 'jymaster' ? ['master', 'flac24', 'flac', '320k'] : pref === 'hires' ? ['flac24', 'flac', '320k'] : pref === 'lossless' ? ['flac', '320k'] : pref === 'exhigh' ? ['320k', '192k', '128k'] : ['128k', '192k', '320k'];
+  const available = Array.isArray(sourceInfo && sourceInfo.qualitys) ? sourceInfo.qualitys.map(String) : [];
+  if (!available.length) return preferred[0];
+  for (const q of preferred) if (available.includes(q)) return q;
+  for (const q of ['master', 'flac24', 'flac', '320k', '192k', '128k']) if (available.includes(q)) return q;
+  return available[0];
+}
+function buildLxSongInfo(song) {
+  song = song || {};
+  const artists = Array.isArray(song.artists) ? song.artists : String(song.artist || '').split('/').map(name => ({ name: name.trim() })).filter(a => a.name);
+  return Object.assign({}, song.lxMusicInfo || {}, song, { id: song.id || song.qqId || song.mid || song.songmid || song.hash || song.rid || '', songmid: song.songmid || song.mid || song.songMid || song.hash || song.rid || '', mid: song.mid || song.songmid || song.hash || song.rid || '', mediaMid: song.mediaMid || song.media_mid || song.strMediaMid || '', strMediaMid: song.strMediaMid || song.mediaMid || song.media_mid || '', name: song.name || song.title || '', singer: artists, artist: song.artist || artists.map(a => a.name).join(' / '), album: song.album || song.albumName || '', albumName: song.albumName || song.album || '', interval: song.interval || song.duration || 0, duration: song.duration || song.interval || 0, source: lxSourceKeyForSong(song) });
+}
+async function handleLxSongUrl(apiId, source, quality, song) {
+  const files = listLxSourceFiles();
+  if (!files.length) return { provider: 'lx', playable: false, error: 'NO_LX_SOURCE', message: '还没有导入 LX 自定义源' };
+  let runtime = null;
+  for (const file of files) { const candidate = await loadLxSourceRuntime(file); if (!apiId || candidate.id === apiId) { runtime = candidate; break; } }
+  if (!runtime) return { provider: 'lx', playable: false, error: 'LX_SOURCE_NOT_FOUND', message: '未找到指定 LX 源' };
+  if (runtime.status === 'failed' || typeof runtime.requestHandler !== 'function') return { provider: 'lx', sourceApi: runtime.name, playable: false, error: 'LX_SOURCE_NOT_READY', message: runtime.message || 'LX 源未初始化' };
+  const lxSource = lxSourceKeyForSong(song, source);
+  const sourceInfo = runtime.sources && runtime.sources[lxSource];
+  if (!sourceInfo) return { provider: 'lx', sourceApi: runtime.name, playable: false, error: 'LX_PLATFORM_NOT_SUPPORTED', message: `该 LX 源不支持 ${lxSource}` };
+  const targetQuality = lxQualityForSong(sourceInfo, quality);
+  const musicInfo = buildLxSongInfo(song);
+  const info = Object.assign({}, musicInfo, { musicInfo, type: targetQuality, quality: targetQuality });
+  const result = await Promise.resolve(runtime.requestHandler({ source: lxSource, action: 'musicUrl', info }));
+  const resolved = typeof result === 'string' ? { url: result } : (result || {});
+  const playUrl = resolved.url || resolved.musicUrl || resolved.location || '';
+  if (!playUrl) return { provider: 'lx', sourceApi: runtime.name, source: lxSource, playable: false, error: 'LX_EMPTY_URL', message: 'LX 源没有返回播放地址' };
+  return { provider: 'lx', sourceApiId: runtime.id, sourceApi: runtime.name, source: lxSource, url: playUrl, playable: true, trial: false, level: quality, quality: targetQuality, headers: resolved.headers || null };
+}
+function normalizeLxSearchSong(item, runtime, source, index) {
+  item = item || {};
+  const singer = item.singer || item.artist || item.artists || item.author || '';
+  const artist = Array.isArray(singer) ? singer.map(a => a && (a.name || a)).filter(Boolean).join(' / ') : String(singer || '');
+  const duration = Number(item.duration || item.interval || item.time || 0) || 0;
+  return {
+    provider: 'lx', source: 'lx', type: 'lx', playable: true,
+    id: item.id || item.songmid || item.mid || item.hash || item.rid || item.vid || `${source}-${index}`,
+    mid: item.mid || item.songmid || item.id || item.hash || item.rid || '',
+    songmid: item.songmid || item.mid || item.id || item.hash || item.rid || '',
+    mediaMid: item.mediaMid || item.media_mid || item.strMediaMid || '',
+    name: item.name || item.songName || item.title || '未知歌曲',
+    artist, artists: Array.isArray(singer) ? singer : artist.split('/').map(name => ({ name: name.trim() })).filter(a => a.name),
+    album: item.album || item.albumName || '', albumName: item.albumName || item.album || '',
+    duration, interval: item.interval || duration, cover: item.pic || item.cover || item.img || item.image || '',
+    lxApiId: runtime.id, lxSourceApi: runtime.name, lxSource: source, lxOriginalProvider: source, lxOriginalSource: source, lxMusicInfo: item,
+  };
+}
+function lxSearchListFromResult(result) {
+  if (Array.isArray(result)) return result;
+  if (!result || typeof result !== 'object') return [];
+  if (Array.isArray(result.list)) return result.list;
+  if (Array.isArray(result.songs)) return result.songs;
+  if (Array.isArray(result.data)) return result.data;
+  if (result.data && Array.isArray(result.data.list)) return result.data.list;
+  if (result.data && Array.isArray(result.data.lists)) return result.data.lists;
+  return [];
+}
+async function handleLxSearch(apiId, source, keywords, page, limit) {
+  keywords = String(keywords || '').trim();
+  if (!keywords) return { provider: 'lx', songs: [] };
+  const files = listLxSourceFiles();
+  const out = [];
+  for (const file of files) {
+    const runtime = await loadLxSourceRuntime(file);
+    if (apiId && runtime.id !== apiId) continue;
+    if (runtime.status === 'failed' || typeof runtime.requestHandler !== 'function') continue;
+    const entries = Object.entries(runtime.sources || {}).filter(([key, info]) => (!source || key === source) && Array.isArray(info && info.actions) && info.actions.includes('musicSearch'));
+    for (const [sourceKey] of entries) {
+      try {
+        const info = { keyword: keywords, keywords, page: Number(page) || 1, pagesize: Number(limit) || 20, pageSize: Number(limit) || 20, limit: Number(limit) || 20 };
+        const result = await Promise.resolve(runtime.requestHandler({ source: sourceKey, action: 'musicSearch', info }));
+        lxSearchListFromResult(result).forEach((item, index) => out.push(normalizeLxSearchSong(item, runtime, sourceKey, index)));
+      } catch (err) { console.warn('[LXSearch]', runtime.name, sourceKey, err && err.message ? err.message : err); }
+    }
+    if (apiId) break;
+  }
+  return { provider: 'lx', songs: out.slice(0, Number(limit) || 20) };
 }
 
 function lowSignalText(value) {
@@ -3413,6 +3623,59 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---------- 搜索 ----------
+  if (pn === '/api/lx/sources') {
+    try {
+      if (req.method === 'POST') {
+        const body = await readRequestBody(req);
+        const info = await importLxSource(body.script || body.data || body.text || '', body.name || '');
+        sendJSON(res, { provider: 'lx', imported: info, sources: await getLxSourceList() });
+      } else {
+        sendJSON(res, { provider: 'lx', sources: await getLxSourceList() });
+      }
+    } catch (err) {
+      console.error('[LXSourceList]', err);
+      sendJSON(res, { provider: 'lx', error: err.message, sources: [] }, 500);
+    }
+    return;
+  }
+
+  if (pn === '/api/lx/search') {
+    try {
+      const kw = url.searchParams.get('keywords') || url.searchParams.get('keyword') || '';
+      const limit = Math.max(4, Math.min(30, parseInt(url.searchParams.get('limit') || '12', 10) || 12));
+      const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1);
+      const data = await handleLxSearch(url.searchParams.get('apiId') || '', url.searchParams.get('source') || '', kw, page, limit);
+      sendJSON(res, data);
+    } catch (err) {
+      console.error('[LXSearch]', err);
+      sendJSON(res, { provider: 'lx', error: err.message, songs: [] }, 500);
+    }
+    return;
+  }
+
+  if (pn === '/api/lx/song/url') {
+    try {
+      const body = req.method === 'POST' ? await readRequestBody(req) : {};
+      const song = body.song || {
+        id: url.searchParams.get('id') || '',
+        mid: url.searchParams.get('mid') || '',
+        mediaMid: url.searchParams.get('mediaMid') || '',
+        provider: url.searchParams.get('provider') || url.searchParams.get('songProvider') || '',
+        source: url.searchParams.get('songSource') || '',
+        name: url.searchParams.get('name') || '',
+        artist: url.searchParams.get('artist') || '',
+        album: url.searchParams.get('album') || '',
+        duration: Number(url.searchParams.get('duration') || 0) || 0,
+      };
+      const data = await handleLxSongUrl(body.apiId || url.searchParams.get('apiId') || '', body.source || url.searchParams.get('source') || '', body.quality || url.searchParams.get('quality') || '', song);
+      sendJSON(res, data, data.playable === false ? 502 : 200);
+    } catch (err) {
+      console.error('[LXSongUrl]', err);
+      sendJSON(res, { provider: 'lx', url: '', playable: false, error: err.message }, 500);
+    }
+    return;
+  }
+
   if (pn === '/api/search') {
     try {
       const kw    = url.searchParams.get('keywords') || '';

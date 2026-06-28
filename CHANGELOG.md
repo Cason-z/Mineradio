@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.2
+
+- 新增 LX Music 自定义音源导入：可从本地导入 `.js` 音源并在 Mineradio 内保存和初始化。
+- 新增 LX 自定义源并列搜索：All 搜索会并列请求网易云、QQ 音乐和支持 `musicSearch` 的 LX 音源，LX 标签页可只看 LX 结果。
+- 新增 LX 播放解析链路：LX 搜索结果和现有搜索结果都可通过导入的 LX 音源解析 `musicUrl` 播放地址。
+- 增加 GitHub Actions Windows 自动构建流程：推送 `main` 产出构建 artifact，推送 `v*` tag 自动生成 Release 资产。
+
 ## v1.1.1
 
 - P0 installer safety fix: installation now defaults to the first available non-C drive from `D:\Mineradio` through `Z:\Mineradio`; it falls back to `C:\Mineradio` only when no D-Z drive exists.
