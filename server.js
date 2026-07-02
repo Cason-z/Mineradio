@@ -1723,10 +1723,8 @@ async function importLxSource(script, preferredName) {
   return publicLxSourceInfo(await loadLxSourceRuntime(filePath));
 }
 function lxSourceKeyForSong(song, requestedSource) {
-  if (requestedSource) return requestedSource;
-  if (song && song.lxSource) return String(song.lxSource);
-  if (song && song.lxOriginalProvider) return String(song.lxOriginalProvider);
-  const provider = String(song && (song.provider || song.source || song.type) || '').toLowerCase();
+  const rawSource = requestedSource || song && song.lxSource || song && song.lxOriginalProvider || song && (song.provider || song.source || song.type) || '';
+  const provider = String(rawSource).toLowerCase();
   if (provider === 'qsvip') return 'qsvip';
   if (provider === 'qq' || provider === 'tx') return 'tx';
   if (provider === 'netease' || provider === 'wy') return 'wy';
